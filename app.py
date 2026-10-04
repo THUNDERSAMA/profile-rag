@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 import numpy as np
+import spaces
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -15,6 +16,9 @@ from huggingface_hub import AsyncInferenceClient
 from pydantic import BaseModel, Field
 from rank_bm25 import BM25Okapi
 
+@spaces.GPU
+def _gpu_noop():
+    return 0
 # ---------- config ----------
 LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
