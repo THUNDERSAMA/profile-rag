@@ -14,12 +14,14 @@ from huggingface_hub import AsyncInferenceClient
 from pydantic import BaseModel, Field
 from rank_bm25 import BM25Okapi
 from rag_index import BASE_DIR, EMBED_MODEL, chunks_fingerprint, load_chunks
+
 # ---------- config ----------
 LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 CACHE = os.getenv("FASTEMBED_CACHE_PATH") or None
 ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "8"))
-TOP_K = 5
+TOP_K = 5   # chunks sent to the LLM
+POOL = 8    # candidates per retriever before fusion
 
 app = FastAPI(title="Portfolio RAG API")
 app.add_middleware(
@@ -36,16 +38,22 @@ def get_embedder():
     if _embedder is None:
         with _embedder_lock:
             if _embedder is None:
-                # Load on the first question so the API can start without loading
-                # the ONNX model or building the document index.
                 from fastembed import TextEmbedding
 
                 _embedder = TextEmbedding(EMBED_MODEL, cache_dir=CACHE, threads=1)
     return _embedder
 
 
+STOP = {"what", "which", "who", "how", "has", "have", "had", "is", "are", "was",
+        "were", "does", "did", "do", "the", "a", "an", "of", "on", "in", "to",
+        "and", "or", "for", "with", "about", "his", "her", "he", "she", "tell",
+        "me", "you", "your"}
+
+
 def tokenize(t: str):
-    return re.findall(r"\w+", t.lower())
+    toks = re.findall(r"\w+", t.lower())
+    return [w[:-1] if len(w) > 3 and w.endswith("s") else w
+            for w in toks if w not in STOP]
 
 
 CHUNKS = load_chunks()
@@ -75,6 +83,18 @@ if (
 BM25 = BM25Okapi([tokenize(c["title"] + " " + c["text"]) for c in CHUNKS])
 
 
+def _warmup():
+    # Load the ONNX model in the background so the API starts fast
+    # but the first visitor doesn't wait ~10s for the model.
+    try:
+        list(get_embedder().query_embed("warmup"))
+    except Exception:
+        pass
+
+
+threading.Thread(target=_warmup, daemon=True).start()
+
+
 # ---------- retrieval ----------
 def view(i, score):
     c = CHUNKS[i]
@@ -92,14 +112,14 @@ def embed_query(q: str):
 def vector_search(v):
     t = time.perf_counter()
     sims = VECS @ v
-    idx = np.argsort(-sims)[:TOP_K]
+    idx = np.argsort(-sims)[:POOL]
     return [view(i, sims[i]) for i in idx], (time.perf_counter() - t) * 1000
 
 
 def keyword_search(q: str):
     t = time.perf_counter()
     scores = BM25.get_scores(tokenize(q))
-    idx = [i for i in np.argsort(-scores)[:TOP_K] if scores[i] > 0]
+    idx = [i for i in np.argsort(-scores)[:POOL] if scores[i] > 0]
     return [view(i, scores[i]) for i in idx], (time.perf_counter() - t) * 1000
 
 
@@ -137,8 +157,11 @@ def evt(name: str, data: dict) -> str:
 
 SYSTEM = (
     "You answer questions about the portfolio owner for hiring managers. "
-    "Use ONLY the provided context. Cite sources like [1], [2]. "
-    "If the context lacks the answer, say so. Be concise and concrete."
+    "Use ONLY the provided context and cite sources like [1]. "
+    "Lead with a direct answer, then name specific projects, technologies and results. "
+    "Never repeat a point, never define generic terms, and never present interests "
+    "as projects. Do not speculate. If the context lacks the answer, say so briefly. "
+    "Keep it under 120 words."
 )
 
 
@@ -167,8 +190,8 @@ async def ask(body: Query, request: Request):
                 asyncio.to_thread(vector_search, v),
                 asyncio.to_thread(keyword_search, q),
             )
-            yield evt("vector", {"hits": vec, "ms": round(vms, 1)})
-            yield evt("keyword", {"hits": kw, "ms": round(kms, 1)})
+            yield evt("vector", {"hits": vec[:TOP_K], "ms": round(vms, 1)})
+            yield evt("keyword", {"hits": kw[:TOP_K], "ms": round(kms, 1)})
 
             fused = rrf([vec, kw])
             yield evt("fusion", {"hits": fused, "method": "Reciprocal Rank Fusion (k=60)"})
@@ -180,7 +203,7 @@ async def ask(body: Query, request: Request):
             stream = await llm.chat_completion(
                 messages=[{"role": "system", "content": SYSTEM},
                           {"role": "user", "content": f"Context:\n{ctx}\n\nQuestion: {q}"}],
-                max_tokens=450, temperature=0.2, stream=True,
+                max_tokens=350, temperature=0.1, stream=True,
             )
             async for chunk in stream:
                 tok = chunk.choices[0].delta.content if chunk.choices else None
