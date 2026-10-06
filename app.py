@@ -2,21 +2,20 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 from collections import defaultdict, deque
-from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from fastembed import TextEmbedding
 from huggingface_hub import AsyncInferenceClient
 from pydantic import BaseModel, Field
 from rank_bm25 import BM25Okapi
+from rag_index import BASE_DIR, EMBED_MODEL, chunks_fingerprint, load_chunks
 # ---------- config ----------
 LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 CACHE = os.getenv("FASTEMBED_CACHE_PATH") or None
 ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "8"))
@@ -28,21 +27,21 @@ app.add_middleware(
 )
 
 llm = AsyncInferenceClient(model=LLM_MODEL, token=os.getenv("HF_TOKEN"))
-embedder = TextEmbedding(EMBED_MODEL, cache_dir=CACHE)
+_embedder = None
+_embedder_lock = threading.Lock()
 
 
-# ---------- load + chunk knowledge base ----------
-def load_chunks():
-    chunks = []
-    data_dir = Path(__file__).resolve().parent / "data"
-    for f in sorted(data_dir.glob("*.md")):
-        for block in re.split(r"\n(?=## )", f.read_text(encoding="utf-8")):
-            block = block.strip()
-            if len(block) < 30:
-                continue
-            title = block.splitlines()[0].lstrip("# ").strip()
-            chunks.append({"id": len(chunks), "source": f.stem, "title": title, "text": block})
-    return chunks
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        with _embedder_lock:
+            if _embedder is None:
+                # Load on the first question so the API can start without loading
+                # the ONNX model or building the document index.
+                from fastembed import TextEmbedding
+
+                _embedder = TextEmbedding(EMBED_MODEL, cache_dir=CACHE, threads=1)
+    return _embedder
 
 
 def tokenize(t: str):
@@ -50,8 +49,29 @@ def tokenize(t: str):
 
 
 CHUNKS = load_chunks()
-VECS = np.array(list(embedder.embed([c["text"] for c in CHUNKS])), dtype="float32")
-VECS /= np.linalg.norm(VECS, axis=1, keepdims=True)
+VECTOR_PATH = BASE_DIR / "data" / "embeddings.npy"
+METADATA_PATH = BASE_DIR / "data" / "embeddings.json"
+if not VECTOR_PATH.exists() or not METADATA_PATH.exists():
+    raise RuntimeError(
+        "Precomputed index missing. Run `python build_index.py` and deploy "
+        "data/embeddings.npy and data/embeddings.json."
+    )
+INDEX_METADATA = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+if (
+    INDEX_METADATA.get("model") != EMBED_MODEL
+    or INDEX_METADATA.get("chunks_sha256") != chunks_fingerprint(CHUNKS)
+):
+    raise RuntimeError(
+        "Precomputed index is stale or uses a different model. Run `python build_index.py` again."
+    )
+VECS = np.load(VECTOR_PATH, mmap_mode="r")
+if (
+    VECS.ndim != 2
+    or VECS.shape[0] != len(CHUNKS)
+    or VECS.shape[0] != INDEX_METADATA.get("count")
+    or VECS.shape[1] != INDEX_METADATA.get("dimensions")
+):
+    raise RuntimeError("Precomputed index shape is invalid. Run `python build_index.py` again.")
 BM25 = BM25Okapi([tokenize(c["title"] + " " + c["text"]) for c in CHUNKS])
 
 
@@ -64,7 +84,7 @@ def view(i, score):
 
 def embed_query(q: str):
     t = time.perf_counter()
-    v = np.array(list(embedder.query_embed(q))[0], dtype="float32")
+    v = np.array(list(get_embedder().query_embed(q))[0], dtype="float32")
     v /= np.linalg.norm(v)
     return v, (time.perf_counter() - t) * 1000
 
